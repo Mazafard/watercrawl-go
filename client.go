@@ -15,10 +15,12 @@ type Client struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+	version    string
 }
 
 // NewClient creates a new WaterCrawl API client
 func NewClient(apiKey string, baseURL string) *Client {
+
 	if baseURL == "" {
 		baseURL = "https://app.watercrawl.dev/"
 	}
@@ -27,6 +29,7 @@ func NewClient(apiKey string, baseURL string) *Client {
 		apiKey:     apiKey,
 		baseURL:    baseURL,
 		httpClient: &http.Client{},
+		version:    Version,
 	}
 }
 
@@ -65,18 +68,28 @@ func (c *Client) doRequest(ctx context.Context, method, endpoint string, queryPa
 	req.Header.Set("User-Agent", "WaterCrawl-Go-SDK")
 	req.Header.Set("Accept-Language", "en-US")
 
+	// For debugging
+	fmt.Printf("Making request to: %s %s\n", method, u.String())
+
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 
+	// Log response status for debugging
+	fmt.Printf("Received response: %d %s\n", resp.StatusCode, resp.Status)
+
 	return resp, nil
 }
 
 // processResponse processes the HTTP response and unmarshals the response body
 func (c *Client) processResponse(resp *http.Response, v interface{}) error {
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusNoContent {
 		return nil
@@ -88,19 +101,26 @@ func (c *Client) processResponse(resp *http.Response, v interface{}) error {
 	}
 
 	if resp.StatusCode >= 400 {
+		// Try to parse error response as JSON
 		var apiErr struct {
 			Error string `json:"error"`
 		}
-		if err := json.Unmarshal(body, &apiErr); err != nil {
-			// If we can't parse the error response, use the raw body
+		if err := json.Unmarshal(body, &apiErr); err == nil && apiErr.Error != "" {
 			return &APIError{
 				StatusCode: resp.StatusCode,
-				Message:    string(body),
+				Message:    apiErr.Error,
 			}
 		}
+
+		// If JSON parsing fails or no error message, use raw body or default message
+		errorMsg := string(body)
+		if errorMsg == "" {
+			errorMsg = fmt.Sprintf("HTTP error %d", resp.StatusCode)
+		}
+
 		return &APIError{
 			StatusCode: resp.StatusCode,
-			Message:    apiErr.Error,
+			Message:    errorMsg,
 		}
 	}
 
@@ -111,4 +131,4 @@ func (c *Client) processResponse(resp *http.Response, v interface{}) error {
 	}
 
 	return nil
-} 
+}

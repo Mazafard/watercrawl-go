@@ -1,6 +1,7 @@
 package watercrawl
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
+	"time"
 )
 
 // GetCrawlRequests retrieves a paginated list of crawl requests
@@ -113,13 +116,34 @@ func (c *Client) DownloadCrawlRequest(ctx context.Context, id string) (map[strin
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			fmt.Printf("Error closing response body: %v\n", err)
+		}
+	}()
 
-	var result map[string]interface{}
-	if err := c.processResponse(resp, &result); err != nil {
-		return nil, err
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	return result, nil
+	// First try to unmarshal as object
+	var resultObj map[string]interface{}
+	if err := json.Unmarshal(body, &resultObj); err != nil {
+		// If that fails, try to unmarshal as array
+		var resultArray []interface{}
+		if err := json.Unmarshal(body, &resultArray); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		}
+
+		// Convert array to map with "results" key
+		resultObj = map[string]interface{}{
+			"results": resultArray,
+		}
+	}
+
+	return resultObj, nil
 }
 
 // MonitorCrawlRequest monitors the status of a crawl request and returns a channel of events
@@ -133,34 +157,86 @@ func (c *Client) MonitorCrawlRequest(ctx context.Context, id string, download bo
 
 	go func() {
 		defer close(eventChan)
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				fmt.Printf("Error closing response body: %v\n", err)
+			}
+		}()
 
-		decoder := json.NewDecoder(resp.Body)
+		// Create a reader for the response body
+		reader := bufio.NewReader(resp.Body)
+
 		for {
 			select {
 			case <-ctx.Done():
+				fmt.Println("Context done, stopping monitoring")
 				return
 			default:
-				var event EventStreamMessage
-				if err := decoder.Decode(&event); err != nil {
+				// Read line by line
+				line, err := reader.ReadString('\n')
+				if err != nil {
 					if err != io.EOF {
-						// Log error if needed
+						fmt.Printf("Error reading line: %v\n", err)
+					} else {
+						fmt.Println("End of stream (EOF)")
 					}
 					return
 				}
 
-				if download && event.Type == "result" {
-					// Download the result data if requested
-					if resultData, ok := event.Data.(map[string]interface{}); ok {
-						downloadedData, err := c.DownloadCrawlRequest(ctx, id)
-						if err == nil {
-							resultData = downloadedData
-							event.Data = resultData
-						}
-					}
+				// Trim whitespace
+				line = strings.TrimSpace(line)
+
+				// Skip empty lines
+				if line == "" {
+					continue
 				}
 
-				eventChan <- &event
+				fmt.Printf("Received line: %s\n", line)
+
+				// Check if it's an SSE data line
+				if strings.HasPrefix(line, "data:") {
+					// Extract the JSON payload
+					jsonData := strings.TrimPrefix(line, "data:")
+					jsonData = strings.TrimSpace(jsonData)
+
+					// Parse the JSON
+					var event EventStreamMessage
+					if err := json.Unmarshal([]byte(jsonData), &event); err != nil {
+						fmt.Printf("Error parsing JSON from SSE: %v\n", err)
+						continue
+					}
+
+					// Process the event
+					if download && event.Type == "result" {
+						// Download the result data if requested
+						if _, ok := event.Data.(map[string]interface{}); ok {
+							// Create a new timeout context for download operation
+							downloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+							downloadedData, err := c.DownloadCrawlRequest(downloadCtx, id)
+							cancel()
+
+							if err == nil {
+								// Replace the entire event data with downloaded data
+								event.Data = downloadedData
+								fmt.Println("Successfully downloaded result data")
+							} else {
+								fmt.Printf("Error downloading result data: %v\n", err)
+							}
+						}
+					}
+
+					// Try to send the event, respecting context cancellation
+					select {
+					case eventChan <- &event:
+						// Event sent successfully
+					case <-ctx.Done():
+						fmt.Println("Context done while sending event")
+						return
+					}
+				} else {
+					// Handle other types of SSE lines if needed (like "id:" or "event:")
+					fmt.Printf("Non-data SSE line: %s\n", line)
+				}
 			}
 		}
 	}()
@@ -205,6 +281,8 @@ func (c *Client) ScrapeURL(ctx context.Context, url string, pageOptions, pluginO
 		return nil, err
 	}
 
+	fmt.Printf("Crawl request created with UUID: %s, Status: %s\n", result.UUID, result.Status)
+
 	if !sync {
 		return map[string]interface{}{
 			"uuid":   result.UUID,
@@ -212,18 +290,101 @@ func (c *Client) ScrapeURL(ctx context.Context, url string, pageOptions, pluginO
 		}, nil
 	}
 
+	fmt.Println("Monitoring crawl request...")
 	events, err := c.MonitorCrawlRequest(ctx, result.UUID, download)
 	if err != nil {
 		return nil, err
 	}
 
+	fmt.Println("Waiting for events...")
+	eventCount := 0
+	var lastProgress float64
+	var lastError interface{}
+	var lastStateData map[string]interface{}
+
 	for event := range events {
-		if event.Type == "result" {
+		eventCount++
+		fmt.Printf("Received event #%d of type: %s\n", eventCount, event.Type)
+
+		switch event.Type {
+		case "result":
+			fmt.Println("Found result event!")
 			if data, ok := event.Data.(map[string]interface{}); ok {
 				return data, nil
+			} else {
+				fmt.Printf("Warning: result event has unexpected data type: %T\n", event.Data)
+			}
+		case "error":
+			fmt.Printf("Error event received: %v\n", event.Data)
+			lastError = event.Data
+		case "progress":
+			if progressData, ok := event.Data.(map[string]interface{}); ok {
+				if progress, ok := progressData["progress"].(float64); ok {
+					lastProgress = progress
+					fmt.Printf("Progress: %.2f%%\n", progress)
+				}
+			}
+		case "state":
+			// Save state data in case we don't get a result event
+			if stateData, ok := event.Data.(map[string]interface{}); ok {
+				lastStateData = stateData
+
+				// Check if status is "completed" or "failed"
+				if status, ok := stateData["status"].(string); ok {
+					if status == "completed" {
+						fmt.Println("Crawl completed according to state event")
+						if download {
+							// Try to download the results
+							downloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+							downloadData, err := c.DownloadCrawlRequest(downloadCtx, result.UUID)
+							cancel()
+
+							if err == nil {
+								return downloadData, nil
+							} else {
+								fmt.Printf("Error downloading result data: %v\n", err)
+							}
+						}
+						// If download failed or wasn't requested, return the state data
+						return stateData, nil
+					} else if status == "failed" {
+						return nil, fmt.Errorf("crawl failed with status: %s", status)
+					}
+				}
+			}
+		case "completed":
+			fmt.Println("Crawl completed event received")
+			// If we receive a completed event but haven't received a result yet, try to download
+			if download {
+				fmt.Println("Attempting to download final results...")
+				downloadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				downloadedData, err := c.DownloadCrawlRequest(downloadCtx, result.UUID)
+				cancel()
+
+				if err == nil && len(downloadedData) > 0 {
+					fmt.Println("Successfully downloaded final results")
+					return downloadedData, nil
+				} else if err != nil {
+					fmt.Printf("Error downloading final results: %v\n", err)
+				} else {
+					fmt.Println("Downloaded results were empty")
+				}
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no result received from crawl request")
-} 
+	// If we have state data but no result, return the state data
+	if lastStateData != nil {
+		return lastStateData, nil
+	}
+
+	// If we get here, we didn't receive a valid result
+	if eventCount == 0 {
+		return nil, fmt.Errorf("no events received from crawl request (timeout or connection error)")
+	} else if lastError != nil {
+		return nil, fmt.Errorf("crawl request failed with error: %v", lastError)
+	} else {
+		return nil, fmt.Errorf("received %d events (last progress: %.2f%%) but no valid result event",
+			eventCount, lastProgress)
+	}
+}
